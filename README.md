@@ -1,11 +1,11 @@
-# no-yap
+# clanker-conduct
 
 Agent skill ([Agent Skills](https://agentskills.io)) for Claude, Cursor, Codex, and other compatible agents.
 
 ## Install
 
 ```bash
-npx skills add mathewjhan/no-yap
+npx skills add mathewjhan/clanker-conduct
 ```
 
 Or import the GitHub repo URL in your agent’s skills / rules UI.
