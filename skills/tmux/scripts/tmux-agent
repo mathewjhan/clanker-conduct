@@ -1,0 +1,638 @@
+#!/usr/bin/env bash
+# Lets an agent open, drive, read, and close tmux windows, panes, and sessions.
+# Run with no arguments for usage.
+set -euo pipefail
+
+owner="${TMUX_AGENT_OWNER:-${TMUX_PANE:-agent}}"
+
+usage() {
+  cat <<'EOF'
+Usage: tmux-agent COMMAND [ARGS]
+
+Context
+  whoami                         Where the agent runs, its own session, and what the
+                                 user is viewing
+  ls                             Every session, window, and pane (ids, command, cwd, owner)
+
+Agent session
+  Each agent gets one tmux session holding its own pane and everything it opens.
+  start TASK-NAME                Create the session named TASK-NAME, move the agent's
+                                 pane into it as window "agent", and switch the
+                                 user's terminal to it. Required before tab/split.
+                                 (TMUX_AGENT_MOVE=0: don't move the agent's pane)
+  name NAME                      Rename the agent's session
+
+Create (nothing takes focus unless --focus is given; prints the new pane id)
+  tab   [-n NAME] [--user-session | -s SESSION] [-c DIR] [--focus] [-- CMD...]
+                                 New window in the agent's session (--user-session:
+                                 in the session the agent started in; -s: in SESSION)
+  split [-t TARGET] [-h|-v] [-b] [-l SIZE] [-c DIR] [--focus] [-- CMD...]
+                                 Split TARGET (default: the agent's own pane)
+
+Drive
+  run   TARGET [-T SECS] -- CMD...   Run CMD at a shell prompt, wait for it to exit,
+                                     print its output and exit code
+  send  TARGET [--no-enter] -- TEXT  Type TEXT literally, then Enter
+  paste TARGET [--no-enter]          Paste stdin (multi-line text for TUIs/agents)
+  keys  TARGET KEY...                Raw tmux keys, e.g. C-c Escape Up
+
+Read
+  read  TARGET [-n LINES | --since]  Visible screen, plus LINES of scrollback,
+                                     or everything since the last run/send/start
+  wait  TARGET REGEX [-T SECS] [--all]
+                                     Wait until REGEX appears in output since the last
+                                     run/send/start (--all: anywhere in recent output)
+
+Arrange
+  focus  [TARGET]                    Show TARGET (default: the agent's session) in the
+                                     user's terminal
+  rename window|session|pane TARGET NAME
+  close  window|session|pane TARGET [--force]   Refuses things the agent didn't create
+  close-mine                         Close everything this agent created
+
+TARGET is a pane id (%5), window id (@3), session id ($1), or session:window.pane.
+EOF
+}
+
+die() {
+  echo "tmux-agent: $*" >&2
+  exit 1
+}
+
+need_arg() {
+  [[ $# -ge 2 && -n "$2" ]] || die "$1 needs a value"
+}
+
+# --- context -------------------------------------------------------------------
+
+# Most recently active client is the terminal the user is looking at.
+active_client_info() {
+  tmux list-clients -F '#{client_activity}	#{client_name}	#{session_id}	#{session_name}	#{window_id}	#{window_index}	#{window_name}	#{pane_id}' 2>/dev/null |
+    sort -rn | head -n 1
+}
+
+active_client() {
+  active_client_info | cut -f2
+}
+
+default_session() {
+  if [[ -n "${TMUX_PANE:-}" ]]; then
+    tmux display -p -t "$TMUX_PANE" '#{session_id}'
+    return
+  fi
+  local info
+  info="$(active_client_info)"
+  [[ -n "$info" ]] || die "no tmux client attached; pass -s SESSION"
+  cut -f3 <<<"$info"
+}
+
+# --- agent session -------------------------------------------------------------
+
+home_session() {
+  local id
+  for id in $(tmux list-sessions -F '#{session_id}' 2>/dev/null); do
+    if [[ "$(tmux show-options -qv -t "$id" @agent_home)" == "$owner" ]]; then
+      echo "$id"
+      return
+    fi
+  done
+}
+
+unused_session_name() {
+  local base="$1" name="$1" n=2
+  while tmux has-session -t "=$name" 2>/dev/null; do
+    name="$base-$n"
+    n=$((n + 1))
+  done
+  echo "$name"
+}
+
+# Detached sessions default to 80x24; match the user's terminal instead.
+client_size_args() {
+  local w h
+  read -r _ w h < <(tmux list-clients -F '#{client_activity} #{client_width} #{client_height}' 2>/dev/null | sort -rn | head -n 1) || true
+  if [[ "${w:-0}" -gt 0 && "${h:-0}" -gt 0 ]]; then
+    echo "-x $w -y $h"
+  fi
+}
+
+require_home_session() {
+  local sid
+  sid="$(home_session)"
+  [[ -n "$sid" ]] || die "no agent session yet; run 'start TASK-NAME' first"
+  echo "$sid"
+}
+
+create_home_session() {
+  local name wid created sid
+  name="$(unused_session_name "$1")"
+  # shellcheck disable=SC2046
+  created="$(tmux new-session -d -s "$name" -c "$PWD" $(client_size_args) -P -F '#{session_id} #{window_id}')" ||
+    die "could not create session $name"
+  read -r sid wid <<<"$created"
+  # An empty id makes tmux act on the current session/window instead.
+  [[ "$sid" == \$* && "$wid" == @* ]] || die "unexpected new-session output: '$created'"
+  tmux set-option -t "$sid" @agent_owner "$owner"
+  tmux set-option -t "$sid" @agent_home "$owner"
+  if [[ -n "${TMUX_PANE:-}" && "${TMUX_AGENT_MOVE:-1}" == 1 ]]; then
+    move_self_into "$sid" "$wid"
+  else
+    tmux set-option -w -t "$wid" @agent_unused 1
+  fi
+  echo "$sid"
+}
+
+# Moves the agent's pane into its session as a window named "agent", so all its
+# work is in one place, and switches the user's terminal there.
+move_self_into() {
+  local sid="$1" placeholder="$2" origin client
+  origin="$(tmux display -p -t "$TMUX_PANE" '#{session_id}')"
+  client="$(active_client)"
+
+  tmux set-option -t "$sid" @agent_origin "$origin"
+  tmux break-pane -d -s "$TMUX_PANE" -t "$sid:"
+  kill_kind window "$placeholder"
+  tmux move-window -s "$TMUX_PANE" -t "$sid:0" 2>/dev/null || true
+  tmux rename-window -t "$TMUX_PANE" agent
+  tmux select-window -t "$TMUX_PANE"
+
+  if [[ -n "$client" ]]; then
+    tmux switch-client -c "$client" -t "$sid"
+  fi
+}
+
+# The session the agent ran in before moving, i.e. the user's session.
+user_session() {
+  local home origin
+  home="$(home_session)"
+  if [[ -n "$home" ]]; then
+    origin="$(tmux show-options -qv -t "$home" @agent_origin)"
+    if [[ -n "$origin" ]] && tmux has-session -t "$origin" 2>/dev/null; then
+      echo "$origin"
+      return
+    fi
+  fi
+  default_session
+}
+
+# The new session's first window is reused by the first 'tab' instead of
+# leaving an empty window behind.
+take_unused_window() {
+  local sid="$1" wid
+  for wid in $(tmux list-windows -t "$sid" -F '#{window_id}'); do
+    if [[ "$(tmux show-options -wqv -t "$wid" @agent_unused)" == 1 ]]; then
+      tmux set-option -wu -t "$wid" @agent_unused
+      tmux display -p -t "$wid" '#{pane_id}'
+      return
+    fi
+  done
+}
+
+pane_of() {
+  tmux display -p -t "$1" '#{pane_id}' 2>/dev/null || die "no such target: $1"
+}
+
+refuse_self() {
+  local pane
+  pane="$(pane_of "$1")"
+  [[ "$pane" != "${TMUX_PANE:-}" ]] || die "refusing to type into the agent's own pane ($pane)"
+  echo "$pane"
+}
+
+# --- output marks --------------------------------------------------------------
+
+# Absolute line number of the cursor, counting scrollback.
+cursor_line() {
+  local hist y
+  read -r hist y < <(tmux display -p -t "$1" '#{history_size} #{cursor_y}')
+  echo $((hist + y))
+}
+
+set_mark() {
+  tmux set-option -p -t "$1" @agent_mark "$(cursor_line "$1")"
+}
+
+strip_trailing_blank() {
+  awk '{ lines[NR] = $0 } NF { last = NR } END { for (i = 1; i <= last; i++) print lines[i] }'
+}
+
+# With skip_typed=1, drops the line the command was typed on so a pattern
+# can't match the command text itself.
+capture_since_mark() {
+  local pane="$1" skip_typed="${2:-0}" mark hist alt start
+  read -r hist alt < <(tmux display -p -t "$pane" '#{history_size} #{alternate_on}')
+  mark="$(tmux show-options -pqv -t "$pane" @agent_mark)"
+  if [[ "$alt" == 1 || -z "$mark" ]]; then
+    tmux capture-pane -p -J -t "$pane" | strip_trailing_blank
+    return
+  fi
+  start=$((mark - hist))
+  ((start >= -hist)) || start="-"
+  tmux capture-pane -p -J -t "$pane" -S "$start" -E - | tail -n "+$((skip_typed + 1))" | strip_trailing_blank
+}
+
+is_shell() {
+  case "$1" in
+    bash | zsh | sh | dash | ksh | fish) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# New panes need a moment for the shell to start and draw its prompt.
+wait_for_prompt() {
+  local pane="$1" deadline=$((SECONDS + 5))
+  while ((SECONDS < deadline)); do
+    if is_shell "$(tmux display -p -t "$pane" '#{pane_current_command}')" &&
+      [[ -n "$(tmux capture-pane -p -t "$pane" | tr -d '[:space:]')" ]]; then
+      return 0
+    fi
+    sleep 0.1
+  done
+}
+
+start_command() {
+  local pane="$1"
+  shift
+  wait_for_prompt "$pane"
+  (($#)) || return 0
+  set_mark "$pane"
+  tmux send-keys -t "$pane" -l -- "$*"
+  tmux send-keys -t "$pane" Enter
+}
+
+# --- ownership -----------------------------------------------------------------
+
+show_owner() {
+  local kind="$1" id="$2"
+  case "$kind" in
+    pane) tmux show-options -pqv -t "$id" @agent_owner ;;
+    window) tmux show-options -wqv -t "$id" @agent_owner ;;
+    session) tmux show-options -qv -t "$id" @agent_owner ;;
+  esac
+}
+
+resolve_id() {
+  local kind="$1" target="$2"
+  tmux display -p -t "$target" "#{${kind}_id}" 2>/dev/null || die "no such $kind: $target"
+}
+
+self_id() {
+  [[ -n "${TMUX_PANE:-}" ]] || return 0
+  tmux display -p -t "$TMUX_PANE" "#{${1}_id}"
+}
+
+kill_kind() {
+  local kind="$1" id="$2"
+  [[ "$id" =~ ^[%@\$][0-9]+$ ]] || die "refusing to kill $kind with id '$id'"
+  tmux "kill-$kind" -t "$id" 2>/dev/null || true
+}
+
+# --- commands ------------------------------------------------------------------
+
+cmd_whoami() {
+  if [[ -n "${TMUX_PANE:-}" ]]; then
+    tmux display -p -t "$TMUX_PANE" \
+      'self:    session #{session_name} (#{session_id}), window #{window_index}:#{window_name} (#{window_id}), pane #{pane_id}'
+  else
+    echo "self:    not inside tmux"
+  fi
+  local info
+  info="$(active_client_info)"
+  if [[ -n "$info" ]]; then
+    IFS=$'\t' read -r _ _ sid sname wid widx wname pid <<<"$info"
+    echo "viewing: session $sname ($sid), window $widx:$wname ($wid), pane $pid"
+  else
+    echo "viewing: no client attached"
+  fi
+  local home
+  home="$(home_session)"
+  if [[ -n "$home" ]]; then
+    tmux display -p -t "$home" 'agent session: #{session_name} (#{session_id}), #{session_windows} window(s)'
+  else
+    echo "agent session: none yet (run 'start TASK-NAME')"
+  fi
+  echo "owner:   $owner"
+}
+
+cmd_start() {
+  [[ $# -eq 1 && -n "$1" ]] || die "start: TASK-NAME required"
+  local sid
+  sid="$(home_session)"
+  if [[ -n "$sid" ]]; then
+    echo "agent session already exists: $(tmux display -p -t "$sid" '#{session_name}') (use 'name' to rename)" >&2
+  else
+    sid="$(create_home_session "$1")"
+  fi
+  tmux display -p -t "$sid" '#{session_name}'
+}
+
+cmd_name() {
+  [[ $# -eq 1 && -n "$1" ]] || die "name: NAME required"
+  local sid
+  sid="$(require_home_session)"
+  if [[ "$(tmux display -p -t "$sid" '#{session_name}')" != "$1" ]]; then
+    tmux rename-session -t "$sid" "$(unused_session_name "$1")"
+  fi
+  tmux display -p -t "$sid" '#{session_name}'
+}
+
+cmd_ls() {
+  local self="${TMUX_PANE:-none}"
+  {
+    printf 'SESSION\tWINDOW\tPANE\tCOMMAND\tCWD\tNOTE\n'
+    tmux list-panes -a -F "#{session_name} (#{session_id})#{?session_attached, attached,}	#{window_id} #{window_index}:#{window_name}#{?window_active,*,}	#{pane_id}#{?pane_active,*,}	#{pane_current_command}	#{pane_current_path}	#{?#{==:#{pane_id},$self},self ,}#{?#{==:#{@agent_owner},$owner},mine,}"
+  } | column -t -s $'\t'
+}
+
+cmd_tab() {
+  local name="" sess="" dir="$PWD" focus=0 here=0
+  while (($#)); do
+    case "$1" in
+      -n) need_arg "$@"; name="$2"; shift 2 ;;
+      -s) need_arg "$@"; sess="$2"; shift 2 ;;
+      -c) need_arg "$@"; dir="$2"; shift 2 ;;
+      --user-session) here=1; shift ;;
+      --focus) focus=1; shift ;;
+      --) shift; break ;;
+      *) die "tab: unknown option $1" ;;
+    esac
+  done
+
+  local pane=""
+  if ((here)); then
+    sess="$(user_session)"
+  elif [[ -z "$sess" ]]; then
+    sess="$(require_home_session)"
+    pane="$(take_unused_window "$sess")"
+  fi
+
+  if [[ -n "$pane" ]]; then
+    tmux respawn-pane -k -t "$pane" -c "$dir"
+    if [[ -n "$name" ]]; then
+      tmux rename-window -t "$pane" "$name"
+    fi
+  else
+    local args=(new-window -d -t "$sess:" -c "$dir" -P -F '#{pane_id}')
+    if [[ -n "$name" ]]; then
+      args+=(-n "$name")
+    fi
+    pane="$(tmux "${args[@]}")"
+  fi
+  tmux set-option -w -t "$pane" @agent_owner "$owner"
+  start_command "$pane" "$@"
+  if ((focus)); then
+    cmd_focus "$pane"
+  fi
+  echo "$pane"
+}
+
+cmd_split() {
+  local target="${TMUX_PANE:-}" dir_flag="-h" before=0 size="" cwd="" focus=0
+  while (($#)); do
+    case "$1" in
+      -t) need_arg "$@"; target="$2"; shift 2 ;;
+      -h | -v) dir_flag="$1"; shift ;;
+      -b) before=1; shift ;;
+      -l) need_arg "$@"; size="$2"; shift 2 ;;
+      -c) need_arg "$@"; cwd="$2"; shift 2 ;;
+      --focus) focus=1; shift ;;
+      --) shift; break ;;
+      *) die "split: unknown option $1" ;;
+    esac
+  done
+  [[ -n "$target" ]] || die "split: not inside tmux; pass -t TARGET"
+  if [[ "$target" == "${TMUX_PANE:-}" ]]; then
+    require_home_session >/dev/null
+  fi
+
+  local args=(split-window -d "$dir_flag" -t "$target" -P -F '#{pane_id}')
+  if ((before)); then
+    args+=(-b)
+  fi
+  if [[ -n "$size" ]]; then
+    args+=(-l "$size")
+  fi
+  if [[ -n "$cwd" ]]; then
+    args+=(-c "$cwd")
+  else
+    args+=(-c "#{pane_current_path}")
+  fi
+  local pane
+  pane="$(tmux "${args[@]}")"
+  tmux set-option -p -t "$pane" @agent_owner "$owner"
+  start_command "$pane" "$@"
+  if ((focus)); then
+    cmd_focus "$pane"
+  fi
+  echo "$pane"
+}
+
+cmd_run() {
+  [[ $# -ge 1 ]] || die "run: TARGET required"
+  local pane timeout=600
+  pane="$(refuse_self "$1")"
+  shift
+  while (($#)); do
+    case "$1" in
+      -T) need_arg "$@"; timeout="$2"; shift 2 ;;
+      --) shift; break ;;
+      *) die "run: unknown option $1" ;;
+    esac
+  done
+  (($#)) || die "run: CMD required after --"
+
+  local current rc_var
+  wait_for_prompt "$pane"
+  current="$(tmux display -p -t "$pane" '#{pane_current_command}')"
+  case "$current" in
+    bash | zsh | sh | dash | ksh) rc_var='$?' ;;
+    fish) rc_var='$status' ;;
+    *) die "run: $pane is running '$current', not a shell prompt; use send/keys instead" ;;
+  esac
+
+  local chan="tmux-agent-$$-$RANDOM"
+  tmux set-option -pu -t "$pane" @agent_rc 2>/dev/null || true
+  set_mark "$pane"
+  tmux send-keys -t "$pane" -l -- "$* ; tmux set -p -t $pane @agent_rc $rc_var \\; wait-for -S $chan"
+  tmux send-keys -t "$pane" Enter
+
+  if ! timeout "$timeout" tmux wait-for "$chan"; then
+    capture_since_mark "$pane" | tail -n 40
+    die "run: still running after ${timeout}s (pane $pane)"
+  fi
+  capture_since_mark "$pane"
+  echo "[exit $(tmux show-options -pqv -t "$pane" @agent_rc)]"
+}
+
+cmd_send() {
+  [[ $# -ge 1 ]] || die "send: TARGET required"
+  local pane enter=1
+  pane="$(refuse_self "$1")"
+  shift
+  while (($#)); do
+    case "$1" in
+      --no-enter) enter=0; shift ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
+  set_mark "$pane"
+  tmux send-keys -t "$pane" -l -- "$*"
+  if ((enter)); then
+    tmux send-keys -t "$pane" Enter
+  fi
+}
+
+cmd_paste() {
+  [[ $# -ge 1 ]] || die "paste: TARGET required"
+  local pane enter=1 buf="tmux-agent-$$"
+  pane="$(refuse_self "$1")"
+  [[ "${2:-}" == "--no-enter" ]] && enter=0
+  set_mark "$pane"
+  tmux load-buffer -b "$buf" -
+  tmux paste-buffer -p -d -b "$buf" -t "$pane"
+  if ((enter)); then
+    sleep 0.2
+    tmux send-keys -t "$pane" Enter
+  fi
+}
+
+cmd_keys() {
+  [[ $# -ge 2 ]] || die "keys: TARGET KEY... required"
+  local pane
+  pane="$(refuse_self "$1")"
+  shift
+  tmux send-keys -t "$pane" "$@"
+}
+
+cmd_read() {
+  [[ $# -ge 1 ]] || die "read: TARGET required"
+  local pane
+  pane="$(pane_of "$1")"
+  case "${2:-}" in
+    "") tmux capture-pane -p -J -t "$pane" | strip_trailing_blank ;;
+    -n) need_arg "$@"; tmux capture-pane -p -J -t "$pane" -S "-$3" | strip_trailing_blank ;;
+    --since) capture_since_mark "$pane" ;;
+    *) die "read: unknown option $2" ;;
+  esac
+}
+
+cmd_wait() {
+  [[ $# -ge 2 ]] || die "wait: TARGET REGEX required"
+  local pane regex="$2" timeout=60 all=0
+  pane="$(pane_of "$1")"
+  shift 2
+  while (($#)); do
+    case "$1" in
+      -T) need_arg "$@"; timeout="$2"; shift 2 ;;
+      --all) all=1; shift ;;
+      *) die "wait: unknown option $1" ;;
+    esac
+  done
+
+  local deadline=$((SECONDS + timeout)) out
+  while ((SECONDS < deadline)); do
+    tmux has-session -t "$pane" 2>/dev/null || die "wait: pane $pane is gone"
+    if ((all)); then
+      out="$(tmux capture-pane -p -J -t "$pane" -S -200)"
+    else
+      out="$(capture_since_mark "$pane" 1)"
+    fi
+    if grep -Eq -- "$regex" <<<"$out"; then
+      grep -E -- "$regex" <<<"$out"
+      return 0
+    fi
+    sleep 0.5
+  done
+  tail -n 20 <<<"$out" >&2
+  die "wait: '$regex' did not appear within ${timeout}s"
+}
+
+cmd_focus() {
+  local target="${1:-}" client sess win pane
+  if [[ -z "$target" ]]; then
+    target="$(home_session)"
+    [[ -n "$target" ]] || die "focus: the agent has no session yet"
+  fi
+  client="$(active_client)"
+  [[ -n "$client" ]] || die "focus: no tmux client attached"
+  read -r sess win pane < <(tmux display -p -t "$target" '#{session_id} #{window_id} #{pane_id}') || true
+  [[ -n "${pane:-}" ]] || die "focus: no such target: $target"
+  tmux switch-client -c "$client" -t "$sess"
+  tmux select-window -t "$win"
+  tmux select-pane -t "$pane"
+}
+
+cmd_rename() {
+  [[ $# -eq 3 ]] || die "rename: window|session|pane TARGET NAME"
+  case "$1" in
+    window) tmux rename-window -t "$2" "$3" ;;
+    session) tmux rename-session -t "$2" "$3" ;;
+    pane) tmux select-pane -t "$2" -T "$3" ;;
+    *) die "rename: kind must be window, session, or pane" ;;
+  esac
+}
+
+cmd_close() {
+  [[ $# -ge 2 ]] || die "close: window|session|pane TARGET [--force]"
+  local kind="$1" id force=0
+  case "$kind" in
+    pane | window | session) ;;
+    *) die "close: kind must be window, session, or pane" ;;
+  esac
+  [[ "${3:-}" == "--force" ]] && force=1
+  id="$(resolve_id "$kind" "$2")"
+  [[ "$id" != "$(self_id "$kind")" ]] || die "close: $kind $id contains the agent itself"
+  if ((!force)) && [[ "$(show_owner "$kind" "$id")" != "$owner" ]]; then
+    die "close: $kind $id was not created by this agent (pass --force if the user asked)"
+  fi
+  kill_kind "$kind" "$id"
+  echo "closed $kind $id"
+}
+
+cmd_close_mine() {
+  local kind id lister
+  for kind in pane window session; do
+    case "$kind" in
+      pane) lister=(list-panes -a -F '#{pane_id}') ;;
+      window) lister=(list-windows -a -F '#{window_id}') ;;
+      session) lister=(list-sessions -F '#{session_id}') ;;
+    esac
+    local self
+    self="$(self_id "$kind")"
+    for id in $(tmux "${lister[@]}"); do
+      [[ "$id" != "$self" ]] || continue
+      [[ "$(show_owner "$kind" "$id" 2>/dev/null)" == "$owner" ]] || continue
+      kill_kind "$kind" "$id"
+      echo "closed $kind $id"
+    done
+  done
+}
+
+main() {
+  (($#)) || { usage; exit 0; }
+  local cmd="$1"
+  shift
+  case "$cmd" in
+    whoami) cmd_whoami ;;
+    ls) cmd_ls ;;
+    tab) cmd_tab "$@" ;;
+    split) cmd_split "$@" ;;
+    start) cmd_start "$@" ;;
+    name) cmd_name "$@" ;;
+    run) cmd_run "$@" ;;
+    send) cmd_send "$@" ;;
+    paste) cmd_paste "$@" ;;
+    keys) cmd_keys "$@" ;;
+    read) cmd_read "$@" ;;
+    wait) cmd_wait "$@" ;;
+    focus) cmd_focus "$@" ;;
+    rename) cmd_rename "$@" ;;
+    close) cmd_close "$@" ;;
+    close-mine) cmd_close_mine ;;
+    -h | --help | help) usage ;;
+    *) die "unknown command '$cmd' (run with no arguments for usage)" ;;
+  esac
+}
+
+main "$@"

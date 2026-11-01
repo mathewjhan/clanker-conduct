@@ -1,5 +1,5 @@
 ---
-name: clanker conduct 
+name: clanker-conduct
 description: My preferences
 ---
 
