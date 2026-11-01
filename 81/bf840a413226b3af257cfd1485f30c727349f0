@@ -1,0 +1,23 @@
+README.md
+  s_c1584688518e35::t_1daf57f7f773aa 8
+skills/tmux/SKILL.md
+  s_c1584688518e35::t_a0b91c6cdc64f5 3,14,16-18,21,24-32,34,36-41,52,58-59,66-68,75-78,84,102-103
+skills/tmux/scripts/tmux-agent
+  s_c1584688518e35::t_4414308abb9ee9 2,6-7,14-15,18-22,25-26,39,42,45,47-49,76-80,83,85,87-90,92-94,104,107,188-189,201-203,206,216-219,221,227,235,246-250,252,254,263,276-280,440,444,449-450,453-454,467-469,471-472,494
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "81bf840a413226b3af257cfd1485f30c727349f0",
+  "prompts": {},
+  "sessions": {
+    "s_c1584688518e35": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a19605-61e9-75b3-8ca8-4f07ef0c0add",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Mathew Han <mathewjhan@gmail.com>"
+    }
+  }
+}
