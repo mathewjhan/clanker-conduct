@@ -5,7 +5,7 @@ Agent skills ([Agent Skills](https://agentskills.io)) for Claude, Cursor, Codex,
 | Skill | Does |
 | --- | --- |
 | [`clanker-conduct`](skills/clanker-conduct/SKILL.md) | My preferences for how agents talk and code |
-| [`tmux`](skills/tmux/SKILL.md) | Lets an agent open tabs, splits, and its own tmux session, run and read commands in them, and clean up |
+| [`tmux`](skills/tmux/SKILL.md) | Lets an agent open tabs and splits in its starting tmux session, run and read commands in them, and close what it opened |
 
 ## Install
 

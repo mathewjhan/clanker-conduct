@@ -1,6 +1,6 @@
 ---
 name: tmux
-description: Open tmux windows (tabs), split panes, run commands in other panes, read their output, wait for servers to be ready, show your work to the user, and close what you opened. The first action is always `tmux-agent start TASK-NAME`, which moves you into your own tmux session; every tab you open goes there. Use when the user asks to do something "in another tab", "beside you", "in a split", "in your session", to read or type into another pane, to switch their view, or to close what you opened.
+description: Manage tmux windows (tabs) and panes in the session where the agent started. Use when the user asks to work in another tab or split, read or type into another pane, show terminal output, or close what the agent opened. The user creates sessions; the agent stays in place.
 ---
 
 # tmux
@@ -11,21 +11,34 @@ Control tmux through `scripts/tmux-agent`, located in the same directory as this
 ta() { bash SKILL_DIR/scripts/tmux-agent "$@"; }
 ```
 
-## Step 1, always: move into your own session
+## Identify your starting session
 
-The first tmux action in every conversation is:
+The user creates and names sessions before starting agents. Keep your pane where it is and create new windows and splits in that session. Do not automatically create, rename, move, or delete sessions or move your own pane.
+
+Begin by checking your location:
 
 ```sh
-ta start TASK-NAME
+ta whoami
 ```
 
-`TASK-NAME` is a short name for the task, such as `fix-login-redirect` or `bump-deps`. Run it before `whoami`, `ls`, `tab`, `split`, or anything else, even if you only intend to read a pane. It:
+The output distinguishes:
 
-1. creates a tmux session named `TASK-NAME`,
-2. moves your own pane into it as window `0:agent`,
-3. switches the user's terminal to that session.
+- `self`: your pane and its current session.
+- `starting session`: the session recorded on first use for this conversation; new windows go here.
+- `viewing`: what the user's terminal currently shows, which may be elsewhere.
 
-If it prints "agent session already exists", you already did this step; continue.
+There is no `ta start` step. Checking your location does not move a pane or change focus.
+
+If `self` is unknown or inconsistent with this conversation, use `ta ls` and `ta read PANE` to identify the pane showing this conversation. Command processes can lack `TMUX_PANE` or inherit another terminal's value. Do not use the focused pane or the command process's parent terminal as proof of your location.
+
+Once the pane is verified, pass its ID explicitly in every shell invocation. For example, if it is `%52`:
+
+```sh
+ta() { TMUX_AGENT_PANE='%52' bash SKILL_DIR/scripts/tmux-agent "$@"; }
+ta whoami
+```
+
+If several panes fit, ask the user which one. The helper refuses to create windows or split panes without an identified starting session; it does not fall back to the session currently on screen.
 
 ## Terms
 
@@ -34,33 +47,15 @@ If it prints "agent session already exists", you already did this step; continue
 - **Pane**: one terminal inside a window. A window can be split into several panes.
 - **IDs**: panes are `%N`, windows `@N`, sessions `$N`. IDs never change while the thing exists; indexes and names can. Always target by ID once you have it.
 
-## Your session
-
-Each agent has one tmux session that holds its own pane and everything it opens.
-
-- It is created by `ta start` (Step 1). `tab` and `split` refuse to run until then.
-- `ta tab` puts new windows in your session and `ta split` splits next to you, also in your session.
-- If the task changes, rename the session: `ta name NEW-NAME`.
-- `ta focus` (no argument) switches the user's terminal back to your session.
-
-## Step 2: check where things are
-
-After Step 1, run `ta whoami`. It prints:
-
-- `self`: the session, window, and pane you run in. After Step 1 this is your session.
-- `viewing`: what the user's terminal is showing right now. This can differ from `self`.
-- `agent session`: your session. If it says "none yet", you skipped Step 1; run it now.
-
-Run `ta ls` when you need to find a pane by its name, command, or directory.
-
 ## Choosing where to act
 
-- No location given, "another tab", "in the background": a new `ta tab` in your session.
+- No location given, "another tab", "in the background": a new `ta tab` in your starting session.
 - "beside you", "next to you", "here": `ta split` of your own pane (the default target).
-- "in my session" (the session the user was in before you moved): `ta tab --user-session`.
 - "the current tab", "the focused pane", "what I'm looking at": the `viewing` location.
 - A name ("the psql pane", "the api tab"): the window, pane, or session with that name or running that command. A name overrides the rules above.
 - If more than one target fits, list the candidates and ask.
+
+Use `ta ls` to find named panes. New windows and splits stay in your starting session even when the user is viewing another session.
 
 ## Commands
 
@@ -68,27 +63,25 @@ Creating prints the new pane ID. Nothing takes focus unless `--focus` is passed.
 
 | Need | Command |
 | --- | --- |
-| Move into your own session (Step 1, always first) | `ta start TASK-NAME` |
-| New tab in your session | `ta tab -n NAME [-c DIR] [-- CMD]` |
-| New tab in the user's original session | `ta tab --user-session -n NAME [-- CMD]` |
-| Split | `ta split [-t TARGET] [-h\|-v] [-b] [-l SIZE] [-- CMD]` |
-| Rename your session | `ta name NAME` |
+| Identify your pane and starting session | `ta whoami` |
+| New tab in your starting session | `ta tab -n NAME [-c DIR] [-- CMD]` |
+| Split within your starting session | `ta split [-t TARGET] [-h\|-v] [-b] [-l SIZE] [-c DIR] [-- CMD]` |
 | Run a command that finishes, get output + exit code | `ta run PANE [-T SECS] -- CMD` |
 | Type a line (shell command, REPL input, `y`) | `ta send PANE -- TEXT` |
 | Multi-line text (prompt for another agent, TUI input) | `printf '%s' "$TEXT" \| ta paste PANE` |
 | Special keys | `ta keys PANE C-c` / `Escape` / `Up` / `q` |
 | Read the screen | `ta read PANE [-n LINES \| --since]` |
 | Wait for output | `ta wait PANE 'REGEX' [-T SECS]` |
-| Show your session / a pane to the user | `ta focus [TARGET]` |
-| Rename | `ta rename window\|session\|pane TARGET NAME` |
-| Close one thing you created | `ta close window\|session\|pane TARGET` |
-| Close everything you created (incl. your session) | `ta close-mine` |
+| Show your starting session / a pane to the user | `ta focus [TARGET]` |
+| Rename a window or pane | `ta rename window\|pane TARGET NAME` |
+| Close one thing you created | `ta close window\|pane TARGET` |
+| Close your windows and panes, preserving sessions | `ta close-mine` |
 
 Split directions: `-h` = right (default), `-v` = below, add `-b` for left/above. `-l 33%` sets the new pane's size.
 
 ## Examples
 
-All examples assume `ta start TASK-NAME` already ran.
+All examples assume your pane and starting session have been verified.
 
 - "Start the dev server in another tab and tell me when it's ready":
   `P=$(ta tab -n dev -- npm run dev)` then `ta wait "$P" 'ready|listening|Local:' -T 120`. On timeout, `ta read "$P"` and report what it shows.
@@ -106,6 +99,6 @@ All examples assume `ta start TASK-NAME` already ran.
 - **Don't take focus unless asked.** Only use `--focus` or `ta focus` when the user wants to see the result.
 - **Read before typing into a pane you didn't create.** Confirm it is waiting for the kind of input you will send: a shell prompt takes commands, a REPL takes its own syntax, a `y/n` prompt takes one key. Multi-line text sent to a shell runs each line as a command.
 - **Use `run` for commands that finish** (tests, builds, scripts). It needs a shell prompt and prints the exit code. **Use `send` + `wait` for commands that keep running** (servers, watchers, REPLs).
-- **Close only what you created.** `close` refuses other things; pass `--force` only when the user explicitly names something they want closed.
-- **Name things after their purpose** (`dev`, `tests`, and your session after the task) so the user and later commands can find them.
+- **Close only what you created.** `close-mine` preserves your pane and the user's sessions. `close` refuses other windows and panes; pass `--force` only when the user explicitly names something they want closed.
+- **Name windows and panes after their purpose** (`dev`, `tests`) so the user and later commands can find them. Leave session management to the user.
 - **Report the session name and pane IDs** of things you start so the user can find them.
